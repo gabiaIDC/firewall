@@ -1,0 +1,355 @@
+#!/bin/sh 
+############################################################################################
+## iptables firewall shell script 
+## ver 1.0.1 2005.08.23
+## Program by Bae,sung-hwan <bsh@gabia.com>
+############################################################################################
+
+## 방화벽에서 사용되는 변수설정 
+
+CONF="/usr/local/firewall/conf"
+#ServerIP=`ifconfig  eth0 | grep "\<inet addr\>" | awk '{ gsub("addr:", "" ) ; print $2}'` 
+ServerIP=`echo 0.0.0.0/0`
+
+## iptables 명령경로 
+if [ -x "/usr/local/sbin/iptables" ]; then
+    IPTABLES="/usr/local/sbin/iptables"
+else
+	  if [ -x "/sbin/iptables" ]; then
+	      IPTABLES="/sbin/iptables"
+	      #IPTABLES="echo iptables"
+  	  else
+          echo "error iptables"
+		  exit 22
+	  fi
+fi 
+
+##  방화벽설정값 
+. $CONF/extend.conf
+
+extend_exec() { 
+
+#if [ "$ICMP" = "YES" ] ; then 
+#	$IPTABLES -A INPUT -p icmp -j ACCEPT
+#fi 
+
+if [ "$OUT_ALLOW_USE" = "YES" ]; then
+
+ if [ "$OUT_ALLOW_GID" != "" ]; then
+	/sbin/modprobe ipt_owner
+	ipt_owner=$?
+	if [ "$ipt_owner" = "0" ] ; then 	
+		for in_gid in ${OUT_ALLOW_GID} ; do
+	   		TEST_GID=`grep -w "^$in_gid" /etc/group | cut -d: -f3`
+	   		if [ "$TEST_GID" != "" ]; then
+	      			$IPTABLES -I GABIA_OUTPUT -m owner --gid-owner ${in_gid} -j ACCEPT
+	   		fi
+		done 
+			$IPTABLES -I GABIA_OUTPUT -m owner --gid-owner 0 -j ACCEPT
+   	else
+			echo "owner modules not found"
+   	fi
+ else
+	modprobe ipt_owner 
+	ipt_owner=$? 
+	if [ "$ipt_owner" = "0" ] ; then 	
+		${IPTABLES} -I GABIA_OUTPUT -m owner --gid-owner 0 -j ACCEPT
+    	else
+		echo "owner modules not found"
+    fi
+ fi
+
+fi
+	
+
+## FLOOD 공격에 방어룰 		
+if [ "$TCP_SYN_FLOOD" = "YES" ] ; then 
+	$IPTABLES -N SYN_FLOOD 
+	$IPTABLES -A INPUT -p tcp --syn -j SYN_FLOOD 
+	$IPTABLES -A SYN_FLOOD -p tcp --syn -m limit --limit $SYN_FLOOD_SEC --limit-burst $SYN_FLOOD_BURST -j RETURN 
+fi 
+
+
+if [ "$KERNEL_PARAM_ADJUST" = "YES" ] ; then 
+	echo "1" > /proc/sys/net/ipv4/tcp_syncookies 
+	echo "$TCP_MAX_SYN_BACKLOG" > /proc/sys/net/ipv4/tcp_max_syn_backlog
+	echo "$TCP_KEEPALIVE_PROBES" > /proc/sys/net/ipv4/tcp_keepalive_probes
+	echo "$TCP_KEEPALIVE_TIME" > /proc/sys/net/ipv4/tcp_keepalive_time
+	echo "$TCP_FIN_TIMEOUT" > /proc/sys/net/ipv4/tcp_fin_timeout
+fi 
+
+if [ "$PING_FLOOD" = "YES" ] ; then 
+	$IPTABLES -N PING_FLOOD 
+	$IPTABLES -A INPUT -p icmp -j PING_FLOOD
+	$IPTABLES -A PING_FLOOD -p icmp --icmp-type echo-request -m limit --limit $PING_FLOOD_SEC -j REJECT
+fi 
+
+if [ "$SCAN_LOG" = "YES" ] ; then 
+	scan_protection
+fi 
+
+if [ "$LOG" = "YES" ] ; then 
+	log_save
+fi 
+}	
+
+
+
+## 방화벽 기본정책 
+Default_Rule_exec() {
+
+	$IPTABLES -F
+	$IPTABLES -X
+	$IPTABLES -P INPUT DROP
+
+	# icmp open 	
+        #$IPTABLES -A INPUT -p icmp -s 211.232.168.129 -j ACCEPT
+        #$IPTABLES -A INPUT -p icmp -s 211.115.83.128/25 -j ACCEPT
+        #$IPTABLES -A INPUT -p icmp -j DROP
+	#$IPTABLES -A INPUT -p icmp -j ACCEPT
+
+
+	$IPTABLES -P OUTPUT ACCEPT
+	#$IPTABLES -P OUTPUT DROP
+
+
+	$IPTABLES -A INPUT -p tcp -m state --state INVALID -j DROP
+	## 기존의 접속에 대해선 허용 
+	$IPTABLES -A INPUT -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+
+	## lo 디바이스에 대해서 모두 열어준다.
+	$IPTABLES -A INPUT -i lo -j ACCEPT
+	$IPTABLES -A INPUT -p tcp -d 0/0 --dport auth -j ACCEPT
+
+	FILTER_CHAINS="GABIA_INPUT GABIA_OUTPUT BLOCK_INPUT"
+	for chain in ${FILTER_CHAINS} ; do
+    	$IPTABLES -t filter -N ${chain} 
+	done
+
+	$IPTABLES -t filter -A INPUT -j BLOCK_INPUT
+
+
+	$IPTABLES -t filter -A INPUT -j GABIA_INPUT 
+	$IPTABLES -t filter -A OUTPUT -j GABIA_OUTPUT
+
+
+
+
+	## AUTH 에 대해서 열어준다.
+
+	## ftp 접속을 하게 한다.
+	#$IPTABLES -A INPUT -p tcp ! --syn --sport 21 --dport 1024: -s 0/0 -j ACCEPT
+	#$IPTABLES -A INPUT -p tcp --sport 20 --dport 1024: -s 0/0 -j ACCEPT 
+	
+	# nobody궈한으로 외부접속을 차단한다
+	#$IPTABLES -A GABIA_OUTPUT -p tcp --sport 1024: --dport 0: -m owner --uid-owner nobody -j ACCEPT
+	#$IPTABLES -A GABIA_OUTPUT -p udp -m owner --uid-owner nobody -j DROP	
+
+
+
+}
+
+## append ( 2005.09.30 ) 
+scan_protection(){ 
+if [ "$SCAN_LOG" = "YES" ] ; then 
+	$IPTABLES -N SCAN_LOG 
+	$IPTABLES -A INPUT -j SCAN_LOG
+	    # (NMAP) FIN/URG/PSH
+    ####################
+    $IPTABLES -A SCAN_LOG -p tcp --tcp-flags ALL FIN,URG,PSH \
+      -d $ServerIP -m limit --limit 1/s --limit-burst 5 -j LOG --log-level $LOGLEVEL --log-prefix "Stealth XMAS scan: "
+
+    # SYN/RST/ACK/FIN/URG
+    #####################
+    $IPTABLES -A SCAN_LOG -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG \
+      -d $ServerIP -m limit --limit 1/s --limit-burst 5 -j LOG --log-level $LOGLEVEL --log-prefix "Stealth XMAS-PSH scan: "
+
+    # ALL/ALL
+    #########
+    $IPTABLES -A SCAN_LOG -p tcp --tcp-flags ALL ALL \
+      -d $ServerIP -m limit --limit 1/s --limit-burst 5 -j LOG --log-level $LOGLEVEL --log-prefix "Stealth XMAS-ALL scan: "
+
+    # NMAP FIN Stealth
+    ##################
+    $IPTABLES -A SCAN_LOG -p tcp --tcp-flags ALL FIN \
+      -d $ServerIP -m limit --limit 1/s --limit-burst 5 -j LOG --log-level $LOGLEVEL --log-prefix "Stealth FIN scan: "
+
+    # SYN/RST
+    #########
+    $IPTABLES -A SCAN_LOG -p tcp --tcp-flags SYN,RST SYN,RST \
+      -d $ServerIP -m limit --limit 1/s --limit-burst 5 -j LOG --log-level $LOGLEVEL --log-prefix "Stealth SYN/RST scan: "
+
+    # SYN/FIN (probably)
+    ####################
+    $IPTABLES -A SCAN_LOG -p tcp --tcp-flags SYN,FIN SYN,FIN \
+      -d $ServerIP -m limit --limit 1/s --limit-burst 5 -j LOG --log-level $LOGLEVEL --log-prefix "Stealth SYN/FIN scan(?): "
+
+    # Null scan
+    ###########
+    $IPTABLES -A SCAN_LOG -p tcp --tcp-flags ALL NONE \
+      -d $ServerIP -m limit --limit 1/s --limit-burst 5 -j LOG --log-level $LOGLEVEL --log-prefix "Stealth Null scan: "
+
+fi
+}
+log_save(){
+	$IPTABLES -A INPUT -p tcp -d $ServerIP --dport 1:65535 -j LOG --log-prefix 'TCP Refuse'
+	$IPTABLES -A INPUT -p udp -d $ServerIP --dport 1:65535 -j LOG --log-prefix 'UDP Refuse'
+}
+
+append_exec()
+{
+        . $CONF/append.conf
+}
+
+
+## Firewall_exec 
+
+## "input_accept.conf alone_input_drop.conf out_accept.conf out_drop.conf" 를 인자로 받아  
+##  내용을 실행시킴 
+firewall_exec() { 
+
+	if   [ $1 = input_accept.conf ] ; then 
+		Erule=InputArule 
+	elif [ $1 = alone_input_drop.conf ] ; then 
+		Erule=InputDrule 
+	elif [ $1 = out_drop.conf ] ; then 
+		Erule=OutDrule 
+	elif [ $1 = out_accept.conf ] ; then 
+		Erule=OutArule 
+	elif [ $1 = global_input_drop.conf ] ; then 
+		Erule=InputDrule
+	elif [ $1 = icmp_accept.conf ] ; then 
+		Erule=IcmpArule
+	elif [ $1 = named.conf ] ; then 
+		Erule=NArule 
+	fi 	
+
+conf_file=$1 
+	
+exec < "$CONF/$conf_file"
+
+while read rule1 rule2 rule3 rule4
+do
+	rule1=`echo $rule1 | sed 's/ //g'` 
+
+	if ! [ $(echo $rule1 | grep "^#") ] ; then 
+
+		if [ "$rule1" != "" ]  ; then 
+		#echo $rule1 
+			
+		Rule_Start $Erule $rule1 $rule2 $rule3 $rule4 
+		fi 	
+	fi 	
+
+done 
+} 
+
+
+## firewall_exec 함수의 인자처리 루틴 
+Rule_Start() { 
+	#echo "Rule_Start" 
+	#eval argu_l=\${$#}
+
+	if [ "$argu_l" = "Error" ] ; then 
+		IPATBLES="echo iptables" 
+	fi 
+
+		
+	
+	if [ "$1" = "InputArule" ] ; then 
+		if [ "$5" = "all" ] ; then
+			$IPTABLES -A GABIA_INPUT -p $5 -s $2 -d $ServerIP -j ACCEPT 
+		else 
+			$IPTABLES -A GABIA_INPUT -p $5 -s $2 --sport $3 -d $ServerIP --dport $4 -j ACCEPT 
+		fi 
+	elif [ "$1" = "InputDrule" ] ; then 
+   		if [ "$5" = "all" ] ; then
+			$IPTABLES -A BLOCK_INPUT -p $5 -s $2 -d $ServerIP -j DROP
+   		else
+	    	$IPTABLES -A BLOCK_INPUT -p $5 -s $2 --sport $3 -d $ServerIP --dport $4 -j DROP
+   		fi
+	elif [ "$1" = "OutDrule" ] ; then 
+   		if [ "$5" = "all" ] ; then
+			$IPTABLES -A GABIA_OUTPUT -p $5 -d $2 -s $ServerIP -j DROP
+   		else
+	    	$IPTABLES -A GABIA_OUTPUT -p $5 -d $2 --sport $3 -s $ServerIP --dport $4 -j DROP
+   		fi
+		
+	
+	elif [ "$1" = "OutArule" ] ; then 
+   		if [ "$5" = "all" ] ; then
+			$IPTABLES -I GABIA_OUTPUT -p $5 -d $2 -j ACCEPT
+   		else
+	    	$IPTABLES -I GABIA_OUTPUT -p $5 -d $2 --sport $3 --dport $4 -j ACCEPT
+   		fi
+		
+		
+	elif [ "$1" = "IcmpArule" ] ; then 
+
+	    	$IPTABLES -I GABIA_INPUT -p $3 -s $2 -d $ServerIP -j ACCEPT
+		
+	elif [ "$1" = "NArule" ] ; then 
+		if [ "$2" = "nameserver" ] ; then 
+	    		$IPTABLES -A GABIA_INPUT -p tcp -s $3 -d $ServerIP --sport 53 --dport 0:  -j ACCEPT
+	    		$IPTABLES -A GABIA_INPUT -p udp -s $3 -d $ServerIP --sport 53 --dport 0:  -j ACCEPT
+		fi 	
+	fi 
+	
+} ## 메인루틴 
+
+Firewall_start(){
+
+	## 기본 방화벽 구성 
+	Default_Rule_exec 
+
+	## firewall_exec 적용 
+	firewall_exec input_accept.conf
+	firewall_exec out_drop.conf
+	firewall_exec out_accept.conf
+	firewall_exec alone_input_drop.conf
+	firewall_exec global_input_drop.conf
+	firewall_exec icmp_accept.conf
+	firewall_exec named.conf
+	
+	extend_exec
+	append_exec
+
+	echo "<<<<<<<<<<<<<<<<<<<<<<<<<  Firewall service start  >>>>>>>>>>>>>>>>>>>>>>>>>"
+}
+
+Firewall_stop()
+
+{
+	$IPTABLES -F
+	$IPTABLES -X
+	$IPTABLES -P INPUT ACCEPT
+	$IPTABLES -P OUTPUT ACCEPT
+	$IPTABLES -P FORWARD ACCEPT
+	echo "<<<<<<<<<<<<<<<<<<<<<<<<<  Firewall service stop   >>>>>>>>>>>>>>>>>>>>>>>>>"
+}
+
+#####################################
+case "$1" in
+	    start)
+	        Firewall_start
+        ;;
+		    stop)
+	        Firewall_stop
+        ;;
+		    status)
+	        $IPTABLES -n -L
+        ;;
+   		    view)
+	        IPTABLES="echo iptables"
+            Firewall_start
+        ;;
+	    restart)
+			Firewall_stop
+			Firewall_start
+			;; 
+		*) 
+		    echo "Usage: $0 {start|stop|restart|status}" 
+		    exit 1
+esac 
+

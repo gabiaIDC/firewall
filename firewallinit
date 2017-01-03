@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+# start/stop the firewall service
+#
+# chkconfig: 2345 99 10
+# description: iptables base firewall service
+# config: /root/firewall/conf
+#
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+export PATH
+
+FIREWALL="/usr/local/firewall/bin/firewall"
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+start() {
+	echo -n "Starting Firewall: "
+	daemon $FIREWALL start
+	echo ""
+}
+stop() {
+	echo -n "Stopping Firewall: "
+	daemon $FIREWALL stop 
+	echo ""
+}
+
+view() {
+	$FIREWALL view
+	echo "view" 
+}
+case "$1" in
+    start)
+	start 
+	;;
+    stop)
+	stop 
+	;;
+    view)
+	#echo "aaaa"
+	view 
+	;;
+    restart|reload)
+	stop
+	start
+	;;
+    *)
+    	echo "Usage: $0 {start|stop|view|restart|reload}"
+	exit 1
+esac
+
+exit 0
